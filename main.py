@@ -7,13 +7,13 @@ from discord.ext import commands, tasks
 
 def yesno(v): return "✅" if v else "❌"
 
-# Read raw env (do NOT cast yet)
+# --- ENV ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 ROLE_MENTION = os.getenv("ROLE_MENTION")
 GUILD_ID_RAW = os.getenv("GUILD_ID")
 
-# Trim whitespace just in case
+# Trim
 if CHANNEL_ID_RAW: CHANNEL_ID_RAW = CHANNEL_ID_RAW.strip()
 if GUILD_ID_RAW:   GUILD_ID_RAW   = GUILD_ID_RAW.strip()
 if ROLE_MENTION:   ROLE_MENTION   = ROLE_MENTION.strip()
@@ -34,19 +34,19 @@ if not GUILD_ID_RAW: missing.append("GUILD_ID")
 
 if missing:
     print(f"❌ Missing environment variables: {', '.join(missing)}")
-    print("➡️  Add them in Railway → Service → Variables, then Redeploy.")
     sys.exit(1)
 
-# Safe cast after validation
+# Cast IDs
 try:
     CHANNEL_ID = int(CHANNEL_ID_RAW)
     GUILD_ID = int(GUILD_ID_RAW)
 except ValueError:
-    print("❌ CHANNEL_ID and GUILD_ID must be numbers only (no quotes/spaces).")
-    print(f"CHANNEL_ID_RAW={CHANNEL_ID_RAW!r}  GUILD_ID_RAW={GUILD_ID_RAW!r}")
+    print("❌ CHANNEL_ID and GUILD_ID must be numbers only.")
     sys.exit(1)
 
-# ===== Bot setup =====
+GUILD = discord.Object(id=GUILD_ID)
+
+# --- BOT ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -59,19 +59,21 @@ def extract_6pm_content(text: str) -> str | None:
 
 @tasks.loop(minutes=2)
 async def check_for_tweets():
+    """Poll @FUTBIN every 2 min and post if new 6pm tweet found."""
     global last_seen_tweet_id
     await bot.wait_until_ready()
 
     try:
         import snscrape.modules.twitter as sntwitter
     except Exception as e:
-        print(f"❌ snscrape not available: {e}")
+        print(f"❌ snscrape import failed: {e}")
+        print("➡️  Ensure requirements.txt pins a working snscrape version and redeploy.")
         return
 
     try:
         channel = bot.get_channel(CHANNEL_ID)
         if channel is None:
-            print(f"❌ Could not resolve CHANNEL_ID={CHANNEL_ID}. Is the bot in that server?")
+            print(f"❌ Could not resolve CHANNEL_ID={CHANNEL_ID}. Is the bot in that server and can it view the channel?")
             return
 
         scraper = sntwitter.TwitterUserScraper("FUTBIN")
@@ -81,11 +83,11 @@ async def check_for_tweets():
                 break
             count += 1
 
-            content = tweet.content or ""
-            if content.startswith("🚨 6pm Content:"):
+            text = tweet.content or ""
+            if text.startswith("🚨 6pm Content:"):
                 if last_seen_tweet_id != tweet.id:
                     last_seen_tweet_id = tweet.id
-                    cleaned = extract_6pm_content(content) or content
+                    cleaned = extract_6pm_content(text) or text
                     msg = f"{ROLE_MENTION}\n**6pm Content:**\n\n{cleaned}"
                     await channel.send(msg[:2000])
                     print("✅ Posted new 6pm content.")
@@ -104,34 +106,31 @@ async def on_ready():
 
 @bot.event
 async def setup_hook():
-    # Instant slash commands if GUILD_ID is set
+    # Register guild-scoped commands so they appear instantly
     try:
-        guild = discord.Object(id=GUILD_ID)
-        synced = await bot.tree.sync(guild=guild)
+        # define the slash command BEFORE syncing
+        @bot.tree.command(name="ping", description="Check if the bot is alive (slash)", guild=GUILD)
+        async def ping_slash(interaction: discord.Interaction):
+            await interaction.response.defer()
+            await interaction.followup.send("🏓 Pong! Bot is online (slash).")
+
+        synced = await bot.tree.sync(guild=GUILD)
         print(f"✅ Synced {len(synced)} slash command(s) to guild {GUILD_ID}.")
     except Exception as e:
         print(f"❌ Failed to sync slash commands: {e}")
 
+    # Also provide a prefix command
+    @bot.command(name="ping", help="Check if the bot is alive (prefix: !ping)")
+    async def ping_prefix(ctx: commands.Context):
+        await ctx.send("🏓 Pong! Bot is online (prefix).")
+
     check_for_tweets.start()
-
-@bot.command(name="ping")
-async def ping_prefix(ctx: commands.Context):
-    await ctx.send("🏓 Pong! Bot is online (prefix).")
-
-@bot.tree.command(name="ping", description="Check if the bot is alive (slash)")
-async def ping_slash(interaction: discord.Interaction):
-    await interaction.response.defer()
-    await interaction.followup.send("🏓 Pong! Bot is online (slash).")
 
 async def main():
     await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
 
 
 
