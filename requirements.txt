@@ -1,5 +1,7 @@
 discord.py>=2.3.2
+# Prefer a working snscrape build; if this ever fails, our code will use the Nitter fallback.
 snscrape @ git+https://github.com/JustAnotherArchivist/snscrape.git
+requests
 
 
 
