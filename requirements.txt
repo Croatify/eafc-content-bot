@@ -1,6 +1,5 @@
 discord.py>=2.3.2
-snscrape
-
+snscrape @ git+https://github.com/JustAnotherArchivist/snscrape.git
 
 
 
