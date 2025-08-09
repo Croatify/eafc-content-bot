@@ -1,8 +1,9 @@
 import os
 import sys
 import re
-import asyncio
 import time
+import random
+import asyncio
 import requests
 import discord
 from discord.ext import commands, tasks
@@ -15,8 +16,8 @@ CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 ROLE_MENTION = os.getenv("ROLE_MENTION")
 GUILD_ID_RAW = os.getenv("GUILD_ID")
 
-# Optional: overrideable Nitter instance for fallback
-NITTER_URL = os.getenv("NITTER_URL", "https://nitter.net").rstrip("/")
+# Optional: prefer this Nitter; otherwise we'll rotate through a list
+PREFERRED_NITTER = os.getenv("NITTER_URL", "").strip().rstrip("/")
 
 # Trim
 if CHANNEL_ID_RAW: CHANNEL_ID_RAW = CHANNEL_ID_RAW.strip()
@@ -36,7 +37,6 @@ if not DISCORD_TOKEN: missing.append("DISCORD_TOKEN")
 if not CHANNEL_ID_RAW: missing.append("CHANNEL_ID")
 if not ROLE_MENTION: missing.append("ROLE_MENTION")
 if not GUILD_ID_RAW: missing.append("GUILD_ID")
-
 if missing:
     print(f"❌ Missing environment variables: {', '.join(missing)}")
     sys.exit(1)
@@ -58,52 +58,101 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 last_seen_tweet_id = None
 
+# ---------- Helpers ----------
+UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+]
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": random.choice(UA_LIST)})
+
+# A rotating list of public Nitter instances (will change over time)
+NITTER_POOL = [i.rstrip("/") for i in filter(None, [
+    PREFERRED_NITTER,
+    "https://nitter.net",
+    "https://nitter.fdn.fr",
+    "https://nitter.moomoo.me",
+    "https://nitter.poast.org",
+    "https://nitter.privacydev.net",
+    "https://nitter.1d4.us",
+    "https://ntrqq.com",  # sometimes works, sometimes not
+])]
+
 def extract_6pm_content(text: str) -> str | None:
     m = re.match(r"^🚨\s*6pm\s*Content:\s*(.*)$", text, flags=re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else None
 
-def fetch_via_nitter() -> tuple[str | None, str | None]:
-    """
-    Fallback: fetch FUTBIN RSS via Nitter and return (tweet_id, full_text) for the latest
-    '🚨 6pm Content:' post if present.
-    """
+def try_snscrape():
+    """Return (tweet_id, body) or (None, None) using snscrape; raise on import error."""
     try:
-        rss_url = f"{NITTER_URL}/FUTBIN/rss"
-        resp = requests.get(rss_url, timeout=15)
-        if resp.status_code != 200:
-            print(f"⚠ Nitter RSS status {resp.status_code}")
-            return None, None
-
-        # Very light parse (avoid extra deps). Look for <item> blocks.
-        text = resp.text
-        items = text.split("<item>")
-        for raw in items[1:10]:  # check first ~9 items
-            # extract title/description/link/guid quickly
-            def tag(name):
-                start = raw.find(f"<{name}>")
-                end   = raw.find(f"</{name}>")
-                if start == -1 or end == -1: return ""
-                return raw[start+len(name)+2:end].strip()
-
-            title = tag("title")
-            desc  = tag("description")
-            link  = tag("link")  # often something like nitter.net/FUTBIN/status/123...
-            guid  = tag("guid")
-
-            body = title or desc or ""
-            if body.startswith("🚨 6pm Content:"):
-                # crude ID: take the last number in link/guid
-                m = re.search(r"/status/(\d+)", link or guid or "")
-                tweet_id = m.group(1) if m else (guid or link or "")
-                return tweet_id, body
-        return None, None
+        import snscrape.modules.twitter as sntwitter  # type: ignore
     except Exception as e:
-        print(f"⚠ Nitter fallback failed: {e}")
+        # Bubble up so caller can switch to fallback
+        raise RuntimeError(f"snscrape import failed: {e}")
+
+    scraper = sntwitter.TwitterUserScraper("FUTBIN")
+    count = 0
+    # snscrape returns an async generator in recent builds
+    async def _scan():
+        nonlocal count
+        async for tweet in scraper.get_items():
+            if count >= 10:
+                break
+            count += 1
+            text = tweet.content or ""
+            if text.startswith("🚨 6pm Content:"):
+                return str(tweet.id), text
         return None, None
+    return _scan()
+
+def fetch_via_nitter():
+    """Rotate through Nitter instances with backoff; return (tweet_id, body) or (None, None)."""
+    pool = list(dict.fromkeys(NITTER_POOL))  # unique & keep order
+    random.shuffle(pool)  # distribute load
+    for base in pool:
+        rss_url = f"{base}/FUTBIN/rss"
+        backoff = 3
+        for attempt in range(3):
+            try:
+                r = SESSION.get(rss_url, timeout=15)
+                status = r.status_code
+                if status == 200:
+                    text = r.text
+                    items = text.split("<item>")
+                    for raw in items[1:10]:  # scan first ~9
+                        def tag(name):
+                            s = raw.find(f"<{name}>"); e = raw.find(f"</{name}>")
+                            if s == -1 or e == -1: return ""
+                            return raw[s+len(name)+2:e].strip()
+                        title = tag("title")
+                        desc  = tag("description")
+                        link  = tag("link")
+                        guid  = tag("guid")
+                        body = title or desc or ""
+                        if body.startswith("🚨 6pm Content:"):
+                            m = re.search(r"/status/(\d+)", link or guid or "")
+                            tw_id = m.group(1) if m else (guid or link or "")
+                            print(f"✅ Nitter hit: {base}")
+                            return tw_id, body
+                    print(f"🔍 No 6pm item on {base}")
+                    break  # break attempts; move to next instance
+                elif status in (403, 429, 502, 503, 520, 522):
+                    print(f"⚠ Nitter {base} status {status}, retry {attempt+1}/3 after {backoff}s")
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                else:
+                    print(f"⚠ Nitter {base} unexpected status {status}, moving on")
+                    break
+            except Exception as e:
+                print(f"⚠ Nitter {base} error: {e}, moving on")
+                break
+    return None, None
 
 @tasks.loop(minutes=2)
 async def check_for_tweets():
-    """Try snscrape first; if that import fails, use Nitter RSS fallback."""
+    """Try snscrape first; if it fails, use robust Nitter rotation with backoff."""
     global last_seen_tweet_id
     await bot.wait_until_ready()
 
@@ -113,55 +162,44 @@ async def check_for_tweets():
         return
 
     # Try snscrape
-    used_fallback = False
     try:
-        import snscrape.modules.twitter as sntwitter  # type: ignore
-        scraper = sntwitter.TwitterUserScraper("FUTBIN")
-        count = 0
-        async for tweet in scraper.get_items():
-            if count >= 10:
-                break
-            count += 1
-
-            text = tweet.content or ""
-            if text.startswith("🚨 6pm Content:"):
-                tw_id = str(tweet.id)
-                if last_seen_tweet_id != tw_id:
-                    last_seen_tweet_id = tw_id
-                    cleaned = extract_6pm_content(text) or text
-                    msg = f"{ROLE_MENTION}\n**6pm Content:**\n\n{cleaned}"
-                    await channel.send(msg[:2000])
-                    print("✅ Posted new 6pm content (snscrape).")
-                else:
-                    print("ℹ️ 6pm content already posted (snscrape).")
-                return
-        else:
-            print("🔍 No matching 6pm Content tweet found (snscrape).")
-            return
-    except Exception as e:
-        print(f"❌ snscrape import/usage failed: {e}")
-        used_fallback = True
-
-    if used_fallback:
-        tw_id, body = fetch_via_nitter()
+        tw_id, body = await try_snscrape()
         if body and body.startswith("🚨 6pm Content:"):
             if last_seen_tweet_id != tw_id:
                 last_seen_tweet_id = tw_id
                 cleaned = extract_6pm_content(body) or body
                 msg = f"{ROLE_MENTION}\n**6pm Content:**\n\n{cleaned}"
                 await channel.send(msg[:2000])
-                print("✅ Posted new 6pm content (Nitter fallback).")
+                print("✅ Posted new 6pm content (snscrape).")
             else:
-                print("ℹ️ 6pm content already posted (Nitter fallback).")
+                print("ℹ️ 6pm content already posted (snscrape).")
+            return
         else:
-            print("🔍 No matching 6pm Content tweet found (fallback).")
+            print("🔍 No matching 6pm Content tweet found (snscrape).")
+            return
+    except Exception as e:
+        print(f"❌ snscrape import/usage failed: {e}")
+
+    # Fallback to Nitter rotation
+    tw_id, body = fetch_via_nitter()
+    if body and body.startswith("🚨 6pm Content:"):
+        if last_seen_tweet_id != tw_id:
+            last_seen_tweet_id = tw_id
+            cleaned = extract_6pm_content(body) or body
+            msg = f"{ROLE_MENTION}\n**6pm Content:**\n\n{cleaned}"
+            await channel.send(msg[:2000])
+            print("✅ Posted new 6pm content (Nitter fallback).")
+        else:
+            print("ℹ️ 6pm content already posted (Nitter fallback).")
+    else:
+        print("🔍 No matching 6pm Content tweet found (fallback).")
 
 # ----- events & commands -----
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
-# Register the slash command at module load (guild-scoped) so sync will see it
+# Register slash command at module level (guild-scoped) so sync sees it
 @bot.tree.command(name="ping", description="Check if the bot is alive (slash)", guild=GUILD)
 async def ping_slash(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -187,9 +225,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
 
 
 
