@@ -1,128 +1,133 @@
 import os
+import sys
 import re
 import asyncio
 import discord
 from discord.ext import commands, tasks
 
-# ====== ENV ======
-TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-ROLE_MENTION = os.getenv("ROLE_MENTION")  # e.g. "<@&1397029826568781997>"
-GUILD_ID = os.getenv("GUILD_ID")          # optional: your server ID as string for instant slash sync
+def yesno(v): return "✅" if v else "❌"
 
-# ====== INTENTS / BOT ======
-intents = discord.Intents.default()
-intents.message_content = True  # needed for prefix commands like !ping
-import discord
-from discord.ext import commands
-import requests
-from bs4 import BeautifulSoup
-import os
-import re
-import asyncio
-import time
-
-# ================================
-# Load environment variables
-# ================================
+# Read raw env (do NOT cast yet)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 ROLE_MENTION = os.getenv("ROLE_MENTION")
-GUILD_ID = os.getenv("GUILD_ID")
+GUILD_ID_RAW = os.getenv("GUILD_ID")
 
-# Check for missing variables
-missing_vars = []
-if not DISCORD_TOKEN:
-    missing_vars.append("DISCORD_TOKEN")
-if not CHANNEL_ID:
-    missing_vars.append("CHANNEL_ID")
-if not ROLE_MENTION:
-    missing_vars.append("ROLE_MENTION")
-if not GUILD_ID:
-    missing_vars.append("GUILD_ID")
+# Trim whitespace just in case
+if CHANNEL_ID_RAW: CHANNEL_ID_RAW = CHANNEL_ID_RAW.strip()
+if GUILD_ID_RAW:   GUILD_ID_RAW   = GUILD_ID_RAW.strip()
+if ROLE_MENTION:   ROLE_MENTION   = ROLE_MENTION.strip()
+if DISCORD_TOKEN:  DISCORD_TOKEN  = DISCORD_TOKEN.strip()
 
-if missing_vars:
-    raise ValueError(f"❌ Missing environment variables: {', '.join(missing_vars)}")
+print("==== ENV CHECK ====")
+print(f"DISCORD_TOKEN present: {yesno(bool(DISCORD_TOKEN))}")
+print(f"CHANNEL_ID present:   {yesno(bool(CHANNEL_ID_RAW))}  value={CHANNEL_ID_RAW!r}")
+print(f"ROLE_MENTION present: {yesno(bool(ROLE_MENTION))}    value={ROLE_MENTION!r}")
+print(f"GUILD_ID present:     {yesno(bool(GUILD_ID_RAW))}    value={GUILD_ID_RAW!r}")
+print("====================")
 
-# Convert numeric IDs
-CHANNEL_ID = int(CHANNEL_ID)
-GUILD_ID = int(GUILD_ID)
+missing = []
+if not DISCORD_TOKEN: missing.append("DISCORD_TOKEN")
+if not CHANNEL_ID_RAW: missing.append("CHANNEL_ID")
+if not ROLE_MENTION: missing.append("ROLE_MENTION")
+if not GUILD_ID_RAW: missing.append("GUILD_ID")
 
-# ================================
-# Discord bot setup
-# ================================
+if missing:
+    print(f"❌ Missing environment variables: {', '.join(missing)}")
+    print("➡️  Add them in Railway → Service → Variables, then Redeploy.")
+    sys.exit(1)
+
+# Safe cast after validation
+try:
+    CHANNEL_ID = int(CHANNEL_ID_RAW)
+    GUILD_ID = int(GUILD_ID_RAW)
+except ValueError:
+    print("❌ CHANNEL_ID and GUILD_ID must be numbers only (no quotes/spaces).")
+    print(f"CHANNEL_ID_RAW={CHANNEL_ID_RAW!r}  GUILD_ID_RAW={GUILD_ID_RAW!r}")
+    sys.exit(1)
+
+# ===== Bot setup =====
 intents = discord.Intents.default()
-intents.message_content = True  # Needed for commands
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-bot = commands.Bot(command_prefix="/", intents=intents)
+last_seen_tweet_id = None
 
-# ================================
-# FUTBIN scrape settings
-# ================================
-URL = "https://x.com/FUTBIN/with_replies"
-last_seen_tweet = None
+def extract_6pm_content(text: str) -> str | None:
+    m = re.match(r"^🚨\s*6pm\s*Content:\s*(.*)$", text, flags=re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
-def extract_6pm_content(text):
-    """Extracts everything after '🚨 6pm Content:' from a tweet."""
-    match = re.match(r"🚨 6pm Content:(.*)", text, re.DOTALL)
-    return match.group(1).strip() if match else None
-
-async def check_for_new_content():
-    """Checks FUTBIN's tweets every 2 minutes for new 6pm Content."""
-    global last_seen_tweet
+@tasks.loop(minutes=2)
+async def check_for_tweets():
+    global last_seen_tweet_id
     await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
 
-    while True:
-        try:
-            import snscrape.modules.twitter as sntwitter
-            tweets = list(sntwitter.TwitterUserScraper("FUTBIN").get_items())
+    try:
+        import snscrape.modules.twitter as sntwitter
+    except Exception as e:
+        print(f"❌ snscrape not available: {e}")
+        return
 
-            for tweet in tweets:
-                if tweet.content.startswith("🚨 6pm Content:"):
-                    if tweet.id != last_seen_tweet:
-                        last_seen_tweet = tweet.id
-                        content = extract_6pm_content(tweet.content)
-                        message = f"{ROLE_MENTION}\n**6pm Content:**\n\n{content}"
-                        await channel.send(message[:2000])
-                    break
+    try:
+        channel = bot.get_channel(CHANNEL_ID)
+        if channel is None:
+            print(f"❌ Could not resolve CHANNEL_ID={CHANNEL_ID}. Is the bot in that server?")
+            return
 
-        except Exception as e:
-            print(f"⚠ Error checking tweets: {e}")
+        scraper = sntwitter.TwitterUserScraper("FUTBIN")
+        count = 0
+        async for tweet in scraper.get_items():
+            if count >= 10:
+                break
+            count += 1
 
-        await asyncio.sleep(120)  # Check every 2 minutes
+            content = tweet.content or ""
+            if content.startswith("🚨 6pm Content:"):
+                if last_seen_tweet_id != tweet.id:
+                    last_seen_tweet_id = tweet.id
+                    cleaned = extract_6pm_content(content) or content
+                    msg = f"{ROLE_MENTION}\n**6pm Content:**\n\n{cleaned}"
+                    await channel.send(msg[:2000])
+                    print("✅ Posted new 6pm content.")
+                else:
+                    print("ℹ️ 6pm content already posted.")
+                break
+        else:
+            print("🔍 No matching 6pm Content tweet found.")
 
-# ================================
-# Bot events & commands
-# ================================
+    except Exception as e:
+        print(f"Error checking tweets: {e}")
+
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-    bot.loop.create_task(check_for_new_content())
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+
+@bot.event
+async def setup_hook():
+    # Instant slash commands if GUILD_ID is set
+    try:
+        guild = discord.Object(id=GUILD_ID)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"✅ Synced {len(synced)} slash command(s) to guild {GUILD_ID}.")
+    except Exception as e:
+        print(f"❌ Failed to sync slash commands: {e}")
+
+    check_for_tweets.start()
 
 @bot.command(name="ping")
-async def ping(ctx):
-    """Test command to see if bot is responding."""
-    await ctx.send("🏓 Bot is online!")
+async def ping_prefix(ctx: commands.Context):
+    await ctx.send("🏓 Pong! Bot is online (prefix).")
 
-# ================================
-# Run bot
-# ================================
-async def start_bot():
-    try:
-        await bot.start(DISCORD_TOKEN)
-    except Exception as e:
-        print(f"❌ Bot crashed: {e}")
+@bot.tree.command(name="ping", description="Check if the bot is alive (slash)")
+async def ping_slash(interaction: discord.Interaction):
+    await interaction.response.defer()
+    await interaction.followup.send("🏓 Pong! Bot is online (slash).")
+
+async def main():
+    await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    while True:
-        try:
-            asyncio.run(start_bot())
-        except Exception as e:
-            print(f"⚠ Bot loop error: {e}")
-        print("🔄 Restarting bot in 5 seconds...")
-        time.sleep(5)
-
+    asyncio.run(main())
 
 
 
